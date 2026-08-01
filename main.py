@@ -94,6 +94,27 @@ def coders(chars):
     return encoder, decoder
 
 
+@torch.no_grad()
+def estimate_loss(logits_fn, loss_fn, train_batch, val_batch, eval_iters=100):
+    # return middle losses
+
+    loss_train = 0.0
+    for _ in range(eval_iters):
+        x, y = train_batch()
+        logits = logits_fn(x)
+        loss = loss_fn(logits, y)
+        loss_train += loss.item()
+
+    loss_val = 0.0
+    for _ in range(eval_iters):
+        x, y = val_batch()
+        logits = logits_fn(x)
+        loss = loss_fn(logits, y)
+        loss_val += loss.item()
+    
+    return loss_train / eval_iters, loss_val / eval_iters
+    
+
 if __name__ == "__main__":
     torch.manual_seed(239)
 
@@ -102,6 +123,8 @@ if __name__ == "__main__":
     batch_size = 32
     lr = 1e-3
     count = 10000
+    eval_iters = 200
+    n_embd = 32
     
     # prepare data
     trans = make_translation_table()
@@ -117,11 +140,13 @@ if __name__ == "__main__":
     
     # studing
     train_batch = make_batch(train_data, block_size, batch_size)
+    val_batch = make_batch(val_data, block_size, batch_size)
     tr = train(optimizer, logits_fn, loss_fn, train_batch, count=count)
 
     for step, loss_value in enumerate(tr, 1):
         if step % 500 == 0:
-            print(step, f"{loss_value:.4f}")
+            loss_train, loss_val = estimate_loss(logits_fn, loss_fn, train_batch, val_batch, eval_iters)
+            print(step, f"{loss_train:.4f}, {loss_val:.4f}")
     
     # generation
     idx = torch.zeros((1,1), dtype=torch.long)
