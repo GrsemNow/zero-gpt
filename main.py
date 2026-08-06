@@ -137,28 +137,35 @@ def self_attention(x, W_q, W_k, W_v, head_size, tril_mask=True):
     return out
 
 
-def make_attention_model(voc_size, n_embd, block_size, head_size):
+def make_attention_model(voc_size, n_embd, block_size, num_head):
+    head_size = n_embd // num_head
+
     embedding_weight = torch.randn(voc_size, n_embd, requires_grad=True)
     position_embedding_table = torch.randn(block_size, n_embd, requires_grad=True)
-
-    # weightes
-    W_q = torch.randn(n_embd, head_size, requires_grad=True)
-    W_k = torch.randn(n_embd, head_size, requires_grad=True)
-    W_v = torch.randn(n_embd, head_size, requires_grad=True)
     
+    # weightes
+    W_q_list, W_k_list, W_v_list = make_multi_head_params(n_embd, num_head, head_size)
+    
+    # feed-forvard params
+    W1, b1, W2, b2 = make_ffn_params(n_embd)
+
     # linear layer
-    lm_head_weight = torch.randn(head_size, voc_size, requires_grad=True)
-    lm_head_bias = torch.randn(voc_size, requires_grad=True)
+    scale_out = 1.0 / (n_embd ** 0.5)
+    lm_head_weight = scaled_randn(n_embd, voc_size, scale=scale_out)
+    lm_head_bias = torch.zeros(voc_size, requires_grad=True)    
     
     def logits_fn(idx):
         # (B, T) -> (B, T, C) logits
         B, T = idx.shape
         tok_emb = F.embedding(idx, embedding_weight)
         pos_emb = F.embedding(torch.arange(T), position_embedding_table)
-        x = (tok_emb + pos_emb)
+        x = tok_emb + pos_emb
         
         # self-attention
-        x = self_attention(x, W_q, W_k, W_v, head_size)
+        x = multi_head_attention(x, W_q_list, W_k_list, W_v_list, tril_mask=True)
+        
+        # ffn
+        x = feed_forward(x, W1, b1, W2, b2)
 
         logits = x @ lm_head_weight + lm_head_bias
         return logits
@@ -171,13 +178,68 @@ def make_attention_model(voc_size, n_embd, block_size, head_size):
     params = {
             'embedding_weight': embedding_weight,
             'position_embedding_table': position_embedding_table,
-            'W_q': W_q,
-            'W_k': W_k,
-            'W_v': W_v,
+            **{f'W_q_{i}': w for i, w in enumerate(W_q_list)},
+            **{f'W_k_{i}': w for i, w in enumerate(W_k_list)},
+            **{f'W_v_{i}': w for i, w in enumerate(W_v_list)},
+            'W1': W1, 'b1': b1, 'W2': W2, 'b2': b2,
             'lm_head_weight': lm_head_weight,
             'lm_head_bias': lm_head_bias,
             }
     return logits_fn, loss_fn, params
+
+
+def make_multi_head_params(n_embd, num_head, head_size):
+    W_q_list = []
+    W_k_list = []
+    W_v_list = []
+    
+    scale = 1.0 / (n_embd ** 0.5)
+    for _ in range(num_head):
+        W_q = scaled_randn(n_embd, head_size, scale=scale)
+        W_k = scaled_randn(n_embd, head_size, scale=scale)
+        W_v = scaled_randn(n_embd, head_size, scale=scale)
+        W_q_list.append(W_q)
+        W_k_list.append(W_k)
+        W_v_list.append(W_v)
+
+    return W_q_list, W_k_list, W_v_list
+
+def multi_head_attention(x, W_q_list, W_k_list, W_v_list, tril_mask=True):
+    head_out = []
+
+    for W_q, W_k, W_v in zip(W_q_list, W_k_list, W_v_list):
+        out = self_attention(x, W_q, W_k, W_v, head_size=W_q.shape[-1], tril_mask=tril_mask)
+        head_out.append(out)
+    
+    return torch.cat(head_out, dim=-1)
+
+
+def make_ffn_params(n_embd):
+    scale1 = (2.0 / n_embd) ** 0.5
+    W1 = scaled_randn(n_embd, 4*n_embd, scale=scale1)
+    b1 = torch.zeros(4*n_embd, requires_grad=True)
+
+    scale2 = (2.0 / (4*n_embd)) ** 0.5
+    W2 = scaled_randn(4*n_embd, n_embd, scale=scale2)
+    b2 = torch.zeros(n_embd, requires_grad=True)
+
+    return W1, b1, W2, b2
+
+
+def feed_forward(x, W1, b1, W2, b2):
+    x = F.relu(x @ W1 + b1)
+    x = x @ W2 + b2
+    return x    
+
+
+def scaled_randn(*shape, scale=1.0):
+    # create scaled random tensor
+    # need because nn.Linear include hidden scaled
+    t = torch.empty(*shape)
+    t.normal_()
+    t.mul_(scale)
+    t.requires_grad_(True)
+    return t
 
 if __name__ == "__main__":
     torch.manual_seed(239)
@@ -186,10 +248,10 @@ if __name__ == "__main__":
     block_size = 64
     batch_size = 32
     lr = 1e-3
-    count = 30000
+    count = 5000
     eval_iters = 200
     n_embd = 64
-    head_size = 32
+    num_head = 4
     
     # prepare data
     trans = make_translation_table()
@@ -200,7 +262,7 @@ if __name__ == "__main__":
     train_data, val_data = data[:n], data[n:]
     
     # model
-    logits_fn, loss_fn, params = make_attention_model(voc_size, n_embd, block_size, head_size)
+    logits_fn, loss_fn, params = make_attention_model(voc_size, n_embd, block_size, num_head)
     optimizer = torch.optim.AdamW(list(params.values()), lr=lr)
     
     # studing
