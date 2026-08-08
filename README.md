@@ -5,7 +5,7 @@
 - [x] Multi-head.
 - [x] Optimization.
 - [x] Text generation.
-- [ ] Fine tuning on second dataset and save waightes + long tuning.
+- [x] Fine tuning on second dataset and save waightes + long tuning.
 - [ ] Visualizations.
 - [ ] Clean code.
 

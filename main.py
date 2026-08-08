@@ -2,6 +2,7 @@ import torch
 from torch.nn import functional as F
 import numpy as np
 # import pandas as pd
+import os
 
 def make_translation_table():
     return str.maketrans({
@@ -256,43 +257,36 @@ def layer_norm(x, gamma, beta, eps=1e-5):
     x_norm = (x - mean) / torch.sqrt(var + eps)
     return x_norm * gamma + beta
 
+def train_base(main_config, train_config, data_path, device='cpu', trans=None, save_dir='saves'):
+    os.makedirs(save_dir, exist_ok=True)
 
-if __name__ == "__main__":
-    # system params for declarativity
-    torch.manual_seed(239)
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # 'cpu' is base
-    print(device)
+    # unpacking main_config
+    block_size = main_config['block_size']
+    batch_size = main_config['batch_size']
+    eval_iters = main_config['eval_iters']
+    n_embd = main_config['n_embd']
+    num_head = main_config['num_head']
+    num_layers = main_config['num_layers']
+    
+    # unpacking train_config
+    lr = train_config['lr']
+    count = train_config['count']
+    patience = train_config['patience']
+    check_int = train_config['check_int']
+    dropout = train_config['dropout']
 
-    # main config
-    block_size = 128
-    batch_size = 64
-    lr = 1e-4
-    count = 80000
-    eval_iters = 200
-    n_embd = 256
-    num_head = 4
-    num_layers = 6
-    dropout = 0.1
-    
-    # train config
-    best_val_loss = float('inf')
-    patience = 5000
-    wait = 0
-    check_int = 2000
-    
     # prepare data
-    trans = make_translation_table()
-    data, chars, encode, decode = prepare_data("data/poems.txt", trans)
+    data, chars, encode, decode = prepare_data(data_path, trans)
     voc_size = len(chars)
     
     n = int(0.9*len(data))
     train_data, val_data = data[:n], data[n:]
-    
+
     # model
     logits_fn, loss_fn, params = make_attention_model(
             voc_size, n_embd, block_size, num_head, num_layers,
             dropout=dropout, device=device)
-    optimizer = torch.optim.AdamW(list(params.values()), lr=lr)
+    optimizer = torch.optim.AdamW(list(params.values()), lr=lr) 
     
     # training
     train_batch = make_batch(train_data, block_size, batch_size)
@@ -307,6 +301,9 @@ if __name__ == "__main__":
     log_lr = []
     
     # train cicle
+    best_val_loss = float('inf')
+    wait = 0
+
     for step, loss_value in enumerate(tr, 1):
         if step % 500 == 0:
             train_loss, val_loss = estimate_loss(
@@ -328,7 +325,7 @@ if __name__ == "__main__":
                     'best_val_loss': best_val_loss,
                     'voc_size': voc_size,
                     'chars': chars,
-                }, '/saves/best_model.pt')
+                }, f'{save_dir}/best_model.pt')
                 print(f"val_loss={best_val_loss:.4f} save")
             else:
                 wait += 500
@@ -342,7 +339,7 @@ if __name__ == "__main__":
                 'params': params,
                 'train_loss': train_loss if 'train_loss' in locals() else None,
                 'val_loss': val_loss if 'val_loss' in locals() else None,
-            }, f'/saves/checkpoint_{step}.pt')
+            }, f'{save_dir}/checkpoint_{step}.pt')
             print(f"check saves on {step}")
   
     # save logs
@@ -353,10 +350,7 @@ if __name__ == "__main__":
         'perplexity': log_perplexity,
         'learning_rate': log_lr,
     }
-    torch.save(log_data, '/saves/train_logs.pt')
-    # to csv
-    # df = pd.DataFrame(log_data)
-    # df.to_csv('/saves/train_logs.csv', index=False)
+    torch.save(log_data, f'{save_dir}/train_logs.pt')
 
     # generation
     idx = torch.zeros((1,1), dtype=torch.long, device=device)
@@ -366,5 +360,175 @@ if __name__ == "__main__":
     gen_text = decode(seq[0].tolist())
     print(gen_text)
 
-    with open('/saves/gen_text.txt', 'w', encoding='utf-8') as f:
-        f.write(generated_text)
+    with open(f'{save_dir}/gen_text.txt', 'w', encoding='utf-8') as f:
+        f.write(gen_text)
+    
+def tune_fine(main_config, tune_config, model_path, data_path, device='cpu', save_dir='saves/fine'):
+    os.makedirs(save_dir, exist_ok=True)
+
+    # unpacking main_config
+    block_size = main_config['block_size']
+    batch_size = main_config['batch_size']
+    eval_iters = main_config['eval_iters']
+    n_embd = main_config['n_embd']
+    num_head = main_config['num_head']
+    num_layers = main_config['num_layers']
+    
+    # unpacking train_config
+    lr = tune_config['lr']
+    count = tune_config['count']
+    patience = tune_config['patience']
+    check_int = tune_config['check_int']
+    dropout = tune_config['dropout']
+
+    # load model
+    model = torch.load(model_path, map_location=device)
+    params = model['params']
+    voc_size = model['voc_size']
+    chars = model['chars']
+    encode, decode = coders(chars)
+
+    # load data
+    with open(data_path, 'r', encoding='utf-8') as f:
+        text = f.read()
+    data = torch.tensor(encode(text), dtype=torch.long)
+    n = int(0.9 * len(data))
+    train_data, val_data = data[:n], data[n:]
+
+    # make model
+    logits_fn, loss_fn, new_params = make_attention_model(
+        voc_size, n_embd, block_size, num_head, num_layers,
+        dropout=dropout, device=device
+    )
+    
+    # copy params
+    for key, value in params.items():
+        new_params[key].data.copy_(value.data)
+    
+    # optimizer
+    optimizer = torch.optim.AdamW(list(new_params.values()), lr=lr)
+
+    # data for curves
+    log_steps = []
+    log_train_loss = []
+    log_val_loss = []
+    log_perplexity = []
+    log_lr = []
+    
+    # training
+    train_batch = make_batch(train_data, block_size, batch_size)
+    val_batch = make_batch(val_data, block_size, batch_size)
+    tr = train(optimizer, logits_fn, loss_fn, train_batch, count, device)
+
+    # tune cicle
+    best_val_loss = float('inf')
+    wait = 0
+
+    for step, loss_value in enumerate(tr, 1):
+        if step % 500 == 0:
+            train_loss, val_loss = estimate_loss(
+                logits_fn, loss_fn, train_batch, val_batch, eval_iters, device
+            )
+            print(f"{step}: train={train_loss:.4f}, val={val_loss:.4f}")
+            log_steps.append(step)
+            log_train_loss.append(train_loss)
+            log_val_loss.append(val_loss)
+            log_perplexity.append(np.exp(val_loss))
+            log_lr.append(optimizer.param_groups[0]['lr'])
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                wait = 0
+                torch.save({
+                    'step': step,
+                    'params': new_params,
+                    'best_val_loss': best_val_loss,
+                    'voc_size': voc_size,
+                    'chars': chars,
+                }, f'{save_dir}/best_tuned.pt')
+                 print(f"val_loss={best_val_loss:.4f} save")
+            else:
+                wait += 500
+                if wait >= patience:
+                    print(f"STOP on {step}")
+                    break
+
+        if step % check_int == 0:
+            torch.save({
+                'step': step,
+                'params': new_params,
+                'train_loss': train_loss if 'train_loss' in locals() else None,
+                'val_loss': val_loss if 'val_loss' in locals() else None,
+            }, f'{save_dir}/checkpoint_{step}.pt')
+            print(f"check saves on {step}") 
+
+    # save logs
+    log_data = {
+        'steps': log_steps,
+        'train_loss': log_train_loss,
+        'val_loss': log_val_loss,
+        'perplexity': log_perplexity,
+        'learning_rate': log_lr,
+    }
+    torch.save(log_data, f'{save_dir}/tune_logs.pt')
+
+    # generation
+    idx = torch.zeros((1,1), dtype=torch.long, device=device)
+    gen = generate_step(logits_fn, idx, count=4100, block_size=block_size, device=device)
+    for seq in gen:
+        pass
+    gen_text = decode(seq[0].tolist())
+    print(gen_text)
+
+    with open(f'{save_dir}/gen_text_tune.txt', 'w', encoding='utf-8') as f:
+        f.write(gen_text)
+
+
+
+
+
+if __name__ == "__main__":
+    # system params for declarativity
+    torch.manual_seed(239)
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu') # 'cpu' is base
+    print(device)
+
+    main_config = {
+            'block_size': 128,
+            'batch_size': 64,
+            'eval_iters': 200,
+            'n_embd': 256,
+            'num_head': 4,
+            'num_layers': 6
+            }
+    
+    train_config = {
+            'patience': 5000,
+            'check_int': 2000,
+            'dropout': 0.1,
+            'lr': 1e-4,
+            'count': 80000
+            }
+
+    tune_config = {
+            'patience': 1000,
+            'check_int': 1000,
+            'dropout': 0.2,
+            'lr': 1e-5,
+            'count': 10000
+            }
+    
+    trans = make_translation_table()
+
+    # base training
+    train_base(main_config, train_config, 'data/poems.txt', trans=trans, device=device, save_dir='saves')
+    
+    # fine tune (clean dataset)
+    tune_fine(
+            main_config=main_config,
+            tune_config=tune_config, 
+            model_path='saves/best_model.pt', 
+            data_path='data/boris.txt', 
+            device=device, 
+            save_dir='saves/fine'
+            )
